@@ -145,11 +145,6 @@ class SerialApp:
         self.log_text = tk.Text(frame_log, height=8, state="disabled")
         self.log_text.pack(fill="both", expand=True)
 
-        # --- Goi y phim tat, luon hien nho o goc man hinh ---
-        hint = tk.Label(self.root, text="Nhan F1 de hien/an bang dieu khien",
-                         bg="black", fg="#888888", font=("Arial", 9))
-        hint.place(relx=0.0, rely=1.0, anchor="sw", x=8, y=-6)
-
     def _toggle_control_panel(self):
         if self.control_visible:
             self.control_panel.place_forget()

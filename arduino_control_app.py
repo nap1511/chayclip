@@ -305,8 +305,12 @@ class SerialApp:
             return
         if which == "obstacle":
             self.obstacle_video_path = path
+            if self.obstacle_active:
+                self._play_video("obstacle")
         else:
             self.no_obstacle_video_path = path
+            if not self.obstacle_active:
+                self._play_video("no_obstacle")
         self._update_video_path_label()
 
     def _update_video_path_label(self):

@@ -1,20 +1,31 @@
 """
-App Windows dieu khien den qua cong COM va hien thi du lieu cam bien tu Arduino.
+App dieu khien den qua cong COM, hien thi trang thai 5 vi tri san pham + cam bien nghieng,
+tu dong do va ket noi Arduino (khong can chon cong COM tay), tu dong phat video tu thu muc clips/.
 
 Cai dat thu vien can thiet (chi can lam 1 lan):
-    pip install pyserial
+    python3 -m pip install pyserial opencv-python pillow
 
 Chay app:
-    python arduino_control_app.py
+    python3 arduino_control_app.py
+
+Thu muc clips/ dat CUNG CHO voi file .py (hoac file .exe sau khi build), chua cac file:
+    bg.mp4   -> clip nen (khong san pham nao bi lay)
+    sp1.mp4  -> clip san pham 1
+    sp2.mp4  -> clip san pham 2
+    sp3.mp4  -> clip san pham 3
+    sp4.mp4  -> clip san pham 4
+    sp5.mp4  -> clip san pham 5
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox
 import serial
 import serial.tools.list_ports
 import threading
 import queue
 import time
+import sys
+import os
 
 try:
     import cv2
@@ -28,6 +39,34 @@ except ImportError:
     ImageTk = None
 
 BAUD_RATE = 9600
+NUM_PRODUCTS = 5
+AUTO_CONNECT_INTERVAL_MS = 3000  # Cu 3 giay thu do lai Arduino neu chua ket noi
+
+# Tu khoa nhan dien Arduino/mach USB-Serial pho bien, dung de tu dong tim dung cong
+ARDUINO_KEYWORDS = [
+    "arduino", "ch340", "wchusbserial", "usbserial", "usbmodem",
+    "usb-serial", "usb serial", "2341", "1a86", "2a03"
+]
+
+
+def _base_dir():
+    """Thu muc chua file .py hoac .exe (de tim thu muc clips/ ben canh no)."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+CLIP_DIR = os.path.join(_base_dir(), "clips")
+
+
+def find_arduino_port():
+    """Quet cac cong COM dang cam, tra ve cong co khop tu khoa Arduino/CH340... dau tien tim thay."""
+    for p in serial.tools.list_ports.comports():
+        text = f"{p.description} {p.hwid}".lower()
+        for kw in ARDUINO_KEYWORDS:
+            if kw in text:
+                return p.device
+    return None
 
 
 class SerialApp:
@@ -41,31 +80,32 @@ class SerialApp:
         self.running = False
         self.msg_queue = queue.Queue()
 
-        # Trang thai bo dem giay khi co vat can
-        self.obstacle_active = False
-        self.obstacle_start_time = None
+        # Trang thai tung vi tri san pham: True = da lay ra, False = con hang
+        self.product_removed_state = [False] * NUM_PRODUCTS
+        self.removal_order = []
 
-        # Duong dan clip video cho 2 truong hop
-        self.obstacle_video_path = None
-        self.no_obstacle_video_path = None
-        self.current_playing = None  # "obstacle" | "no_obstacle" | None
+        # Duong dan clip (nap tu thu muc clips/)
+        self.product_video_paths = [None] * NUM_PRODUCTS
+        self.background_video_path = None
+        self.current_playing = None
 
-        self.video_capture = None   # cv2.VideoCapture dang mo
-        self.video_delay = 33       # ms giua cac khung hinh (~30fps mac dinh)
+        self.any_removed_active = False
+        self.removal_start_time = None
 
-        self.control_visible = False  # Giao dien dieu khien mac dinh an di
+        self.video_capture = None
+        self.video_delay = 33
+
+        self.control_visible = False
 
         self._build_ui()
-        self._refresh_ports()
+        self._load_clips_from_folder()
         self._poll_queue()
         self._update_timer()
         self._update_video_frame()
+        self._auto_connect_tick()  # Bat dau vong tu dong do & ket noi Arduino
 
-        # Chay full man hinh (macOS/Windows). Nhan ESC de thoat fullscreen.
         self.root.attributes("-fullscreen", True)
         self.root.bind("<Escape>", lambda e: self.root.attributes("-fullscreen", False))
-
-        # Phim tat F1 de hien/an giao dien dieu khien
         self.root.bind("<F1>", lambda e: self._toggle_control_panel())
 
     def _build_ui(self):
@@ -76,24 +116,18 @@ class SerialApp:
         # --- Lop noi: khung dieu khien, an mac dinh, hien khi nhan F1 ---
         self.control_panel = tk.Frame(self.root, bg="#1e1e1e")
 
-        # --- Khung chon cong COM ---
+        # --- Khung trang thai ket noi (tu dong, khong can chon tay) ---
         frame_top = ttk.Frame(self.control_panel, padding=10)
         frame_top.pack(fill="x")
 
-        ttk.Label(frame_top, text="Cong COM:").pack(side="left")
-        self.port_combo = ttk.Combobox(frame_top, width=15, state="readonly")
-        self.port_combo.pack(side="left", padx=5)
+        self.status_label = ttk.Label(frame_top, text="Dang do Arduino...", foreground="orange")
+        self.status_label.pack(side="left", padx=5)
 
-        ttk.Button(frame_top, text="Lam moi", command=self._refresh_ports).pack(side="left", padx=5)
-
-        self.connect_btn = ttk.Button(frame_top, text="Ket noi", command=self._toggle_connect)
-        self.connect_btn.pack(side="left", padx=5)
-
-        self.status_label = ttk.Label(frame_top, text="Chua ket noi", foreground="red")
-        self.status_label.pack(side="left", padx=10)
+        ttk.Button(frame_top, text="Do lai ngay", command=self._auto_connect_tick_manual).pack(
+            side="left", padx=5)
 
         # --- Khung dieu khien den ---
-        frame_led = ttk.LabelFrame(self.control_panel, text="Dieu khien den (chan A0 - dung chung voi canh bao)", padding=10)
+        frame_led = ttk.LabelFrame(self.control_panel, text="Dieu khien den (chan A0)", padding=10)
         frame_led.pack(fill="x", padx=10, pady=10)
 
         ttk.Button(frame_led, text="BAT DEN", command=lambda: self._send_command('1')).pack(
@@ -108,8 +142,11 @@ class SerialApp:
         self.tilt_label = ttk.Label(frame_status, text="Nghieng: --", font=("Arial", 11))
         self.tilt_label.pack(anchor="w")
 
-        self.obstacle_label = ttk.Label(frame_status, text="Vat can: --", font=("Arial", 11))
-        self.obstacle_label.pack(anchor="w")
+        self.product_labels = []
+        for i in range(NUM_PRODUCTS):
+            lbl = ttk.Label(frame_status, text=f"San pham {i + 1}: --", font=("Arial", 11))
+            lbl.pack(anchor="w")
+            self.product_labels.append(lbl)
 
         self.alert_label = ttk.Label(frame_status, text="Den A0: --", font=("Arial", 12, "bold"))
         self.alert_label.pack(anchor="w", pady=5)
@@ -117,32 +154,28 @@ class SerialApp:
         self.manual_label = ttk.Label(frame_status, text="Dieu khien tay: --", font=("Arial", 10))
         self.manual_label.pack(anchor="w")
 
-        # --- Khung dong ho dem giay vat can ---
-        frame_timer = ttk.LabelFrame(self.control_panel, text="Thoi gian co vat can lien tuc", padding=10)
+        # --- Khung dong ho dem giay ---
+        frame_timer = ttk.LabelFrame(self.control_panel, text="Thoi gian co san pham dang bi lay ra", padding=10)
         frame_timer.pack(fill="x", padx=10, pady=5)
 
         self.timer_label = ttk.Label(frame_timer, text="0.0 giay", font=("Arial", 28, "bold"))
         self.timer_label.pack(anchor="center", pady=5)
 
-        # --- Khung chon clip video ---
-        frame_video_select = ttk.LabelFrame(self.control_panel, text="Chon clip video", padding=10)
-        frame_video_select.pack(fill="x", padx=10, pady=5)
+        # --- Khung trang thai clip (doc tu thu muc clips/) ---
+        frame_clip = ttk.LabelFrame(self.control_panel, text=f"Clip video (thu muc: {CLIP_DIR})", padding=10)
+        frame_clip.pack(fill="both", expand=True, padx=10, pady=5)
 
-        ttk.Button(frame_video_select, text="Chon clip KHI CO vat can",
-                   command=lambda: self._choose_video("obstacle")).pack(
-            side="left", expand=True, fill="x", padx=5)
-        ttk.Button(frame_video_select, text="Chon clip KHI KHONG CO vat can",
-                   command=lambda: self._choose_video("no_obstacle")).pack(
-            side="left", expand=True, fill="x", padx=5)
+        ttk.Button(frame_clip, text="Nap lai clip tu thu muc", command=self._load_clips_from_folder).pack(
+            fill="x", pady=(0, 5))
 
-        self.video_path_label = ttk.Label(self.control_panel, text="Chua chon clip nao.", font=("Arial", 9))
-        self.video_path_label.pack(fill="x", padx=10)
+        self.clip_status_text = tk.Text(frame_clip, height=7, state="disabled", font=("Arial", 9))
+        self.clip_status_text.pack(fill="both", expand=True)
 
         # --- Khung log du lieu tho ---
         frame_log = ttk.LabelFrame(self.control_panel, text="Du lieu nhan duoc", padding=10)
         frame_log.pack(fill="both", expand=True, padx=10, pady=5)
 
-        self.log_text = tk.Text(frame_log, height=8, state="disabled")
+        self.log_text = tk.Text(frame_log, height=6, state="disabled")
         self.log_text.pack(fill="both", expand=True)
 
     def _toggle_control_panel(self):
@@ -153,50 +186,82 @@ class SerialApp:
             self.control_panel.lift()
         self.control_visible = not self.control_visible
 
-    def _refresh_ports(self):
-        ports = [p.device for p in serial.tools.list_ports.comports()]
-        self.port_combo["values"] = ports
-        if ports:
-            self.port_combo.current(0)
+    # ===== NAP CLIP TU THU MUC CO DINH =====
+    def _load_clips_from_folder(self):
+        os.makedirs(CLIP_DIR, exist_ok=True)  # Tu tao thu muc neu chua co, de nguoi dung biet cho bo file vao
 
-    def _toggle_connect(self):
+        bg_path = os.path.join(CLIP_DIR, "bg.mp4")
+        self.background_video_path = bg_path if os.path.exists(bg_path) else None
+
+        for i in range(NUM_PRODUCTS):
+            p = os.path.join(CLIP_DIR, f"sp{i + 1}.mp4")
+            self.product_video_paths[i] = p if os.path.exists(p) else None
+
+        # Neu dang khong co san pham nao bi lay va vua nap lai clip nen -> phat lai cho chac
+        if not self.removal_order and self.background_video_path:
+            self.current_playing = None  # Ep phat lai
+            self._play_video("background")
+
+        self._update_clip_status_label()
+
+    def _update_clip_status_label(self):
+        lines = [f"Nen (bg.mp4): {'OK' if self.background_video_path else 'THIEU FILE'}"]
+        for i in range(NUM_PRODUCTS):
+            ok = self.product_video_paths[i] is not None
+            lines.append(f"SP{i + 1} (sp{i + 1}.mp4): {'OK' if ok else 'THIEU FILE'}")
+
+        self.clip_status_text.config(state="normal")
+        self.clip_status_text.delete("1.0", "end")
+        self.clip_status_text.insert("1.0", "\n".join(lines))
+        self.clip_status_text.config(state="disabled")
+
+    # ===== TU DONG DO VA KET NOI ARDUINO =====
+    def _auto_connect_tick(self):
+        if not (self.ser and self.ser.is_open):
+            port = find_arduino_port()
+            if port:
+                self._connect_to(port)
+            else:
+                self.status_label.config(text="Khong tim thay Arduino (dang do...)", foreground="orange")
+        self.root.after(AUTO_CONNECT_INTERVAL_MS, self._auto_connect_tick)
+
+    def _auto_connect_tick_manual(self):
+        # Cho phep nguoi dung bam "Do lai ngay" thay vi cho 3 giay
         if self.ser and self.ser.is_open:
             self._disconnect()
+        port = find_arduino_port()
+        if port:
+            self._connect_to(port)
         else:
-            self._connect()
+            self.status_label.config(text="Khong tim thay Arduino", foreground="red")
 
-    def _connect(self):
-        port = self.port_combo.get()
-        if not port:
-            messagebox.showwarning("Chua chon cong", "Vui long chon cong COM truoc.")
-            return
+    def _connect_to(self, port: str):
         try:
             self.ser = serial.Serial(port, BAUD_RATE, timeout=1)
             time.sleep(2)  # Cho Arduino reset sau khi mo cong serial
             self.running = True
             self.read_thread = threading.Thread(target=self._read_loop, daemon=True)
             self.read_thread.start()
-
             self.status_label.config(text=f"Da ket noi ({port})", foreground="green")
-            self.connect_btn.config(text="Ngat ket noi")
-        except serial.SerialException as e:
-            messagebox.showerror("Loi ket noi", f"Khong the mo cong {port}:\n{e}")
+        except serial.SerialException:
+            self.status_label.config(text=f"Loi mo cong {port}, se thu lai...", foreground="red")
+            self.ser = None
 
     def _disconnect(self):
         self.running = False
         if self.ser and self.ser.is_open:
             self.ser.close()
-        self.status_label.config(text="Chua ket noi", foreground="red")
-        self.connect_btn.config(text="Ket noi")
+        self.ser = None
+        self.status_label.config(text="Dang do Arduino...", foreground="orange")
 
     def _send_command(self, cmd: str):
         if self.ser and self.ser.is_open:
             try:
                 self.ser.write(cmd.encode())
-            except serial.SerialException as e:
-                messagebox.showerror("Loi gui lenh", str(e))
+            except serial.SerialException:
+                pass
         else:
-            messagebox.showwarning("Chua ket noi", "Hay ket noi cong COM truoc khi dieu khien.")
+            messagebox.showwarning("Chua ket noi", "Chua tim thay Arduino, dang tu do lai...")
 
     def _read_loop(self):
         while self.running and self.ser and self.ser.is_open:
@@ -205,6 +270,9 @@ class SerialApp:
                 if line:
                     self.msg_queue.put(line)
             except serial.SerialException:
+                # Mat ket noi (rut day, tat may...) -> danh dau ngat, vong auto-connect se tu tim lai
+                self.running = False
+                self.root.after(0, self._disconnect)
                 break
 
     def _poll_queue(self):
@@ -221,35 +289,52 @@ class SerialApp:
         self.log_text.config(state="disabled")
 
     def _parse_line(self, line: str):
-        # Dinh dang mong doi: TILT:1,OBSTACLE:0,ALERT:1
-        if "TILT:" not in line:
+        if "TILT:" not in line or "PROD:" not in line:
             return
         try:
             parts = dict(item.split(":") for item in line.split(","))
             tilt = parts.get("TILT")
-            obstacle = parts.get("OBSTACLE")
+            prod = parts.get("PROD")
             alert = parts.get("ALERT")
             manual = parts.get("MANUAL")
 
             if tilt is not None:
                 self.tilt_label.config(
                     text=f"Nghieng: {'CO' if tilt == '1' else 'Khong'}")
-            if obstacle is not None:
-                is_obstacle = obstacle == '1'
-                self.obstacle_label.config(
-                    text=f"Vat can: {'CO' if is_obstacle else 'Khong'}")
 
-                if is_obstacle and not self.obstacle_active:
-                    # Vua moi phat hien vat can -> bat dau dem tu 0
-                    self.obstacle_active = True
-                    self.obstacle_start_time = time.time()
-                    self._play_video("obstacle")
-                elif not is_obstacle and self.obstacle_active:
-                    # Het vat can -> dung dem, tro ve 0
-                    self.obstacle_active = False
-                    self.obstacle_start_time = None
+            if prod is not None and len(prod) == NUM_PRODUCTS:
+                for i in range(NUM_PRODUCTS):
+                    is_removed = prod[i] == '1'
+                    old_state = self.product_removed_state[i]
+
+                    self.product_labels[i].config(
+                        text=f"San pham {i + 1}: {'DA LAY RA' if is_removed else 'Con hang'}",
+                        foreground="red" if is_removed else "black")
+
+                    if is_removed and not old_state:
+                        if i not in self.removal_order:
+                            self.removal_order.append(i)
+                    elif not is_removed and old_state:
+                        if i in self.removal_order:
+                            self.removal_order.remove(i)
+
+                    self.product_removed_state[i] = is_removed
+
+                if self.removal_order:
+                    target_idx = self.removal_order[0]
+                    self._play_video(("product", target_idx))
+                else:
+                    self._play_video("background")
+
+                any_removed = bool(self.removal_order)
+                if any_removed and not self.any_removed_active:
+                    self.any_removed_active = True
+                    self.removal_start_time = time.time()
+                elif not any_removed and self.any_removed_active:
+                    self.any_removed_active = False
+                    self.removal_start_time = None
                     self.timer_label.config(text="0.0 giay")
-                    self._play_video("no_obstacle")
+
             if alert is not None:
                 is_alert = alert == '1'
                 self.alert_label.config(
@@ -258,12 +343,12 @@ class SerialApp:
             if manual is not None:
                 self.manual_label.config(
                     text=f"Dieu khien tay: {'BAT' if manual == '1' else 'TAT'}")
-        except (ValueError, KeyError):
-            pass  # Bo qua dong du lieu khong dung dinh dang
+        except (ValueError, KeyError, IndexError):
+            pass
 
     def _update_timer(self):
-        if self.obstacle_active and self.obstacle_start_time is not None:
-            elapsed = time.time() - self.obstacle_start_time
+        if self.any_removed_active and self.removal_start_time is not None:
+            elapsed = time.time() - self.removal_start_time
             self.timer_label.config(text=f"{elapsed:.1f} giay")
         self.root.after(100, self._update_timer)
 
@@ -271,7 +356,6 @@ class SerialApp:
         if cv2 is not None and Image is not None and self.video_capture is not None:
             ret, frame = self.video_capture.read()
             if not ret:
-                # Het video -> quay lai frame dau de lap lai
                 self.video_capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 ret, frame = self.video_capture.read()
             if ret:
@@ -281,47 +365,25 @@ class SerialApp:
                 img = Image.fromarray(frame)
                 img.thumbnail((max(w, 1), max(h, 1)))
                 imgtk = ImageTk.PhotoImage(image=img)
-                self.video_label.imgtk = imgtk  # giu tham chieu, tranh bi thu gom rac
+                self.video_label.imgtk = imgtk
                 self.video_label.config(image=imgtk)
         self.root.after(self.video_delay, self._update_video_frame)
 
-    def _choose_video(self, which: str):
-        if cv2 is None or Image is None:
-            messagebox.showerror(
-                "Thieu thu vien",
-                "Chay lenh sau roi khoi dong lai app:\n"
-                "python3 -m pip install opencv-python pillow")
-            return
-        path = filedialog.askopenfilename(
-            title="Chon file video",
-            filetypes=[("Video files", "*.mp4 *.mov *.avi *.mkv"), ("Tat ca file", "*.*")]
-        )
-        if not path:
-            return
-        if which == "obstacle":
-            self.obstacle_video_path = path
-            if self.obstacle_active:
-                self._play_video("obstacle")
-        else:
-            self.no_obstacle_video_path = path
-            if not self.obstacle_active:
-                self._play_video("no_obstacle")
-        self._update_video_path_label()
-
-    def _update_video_path_label(self):
-        obs = self.obstacle_video_path or "(chua chon)"
-        no_obs = self.no_obstacle_video_path or "(chua chon)"
-        self.video_path_label.config(
-            text=f"Vat can: {obs}   |   Khong vat can: {no_obs}")
-
-    def _play_video(self, which: str):
+    def _play_video(self, which):
         if cv2 is None:
             return
-        path = self.obstacle_video_path if which == "obstacle" else self.no_obstacle_video_path
+        if which == self.current_playing:
+            return
+
+        if which == "background":
+            path = self.background_video_path
+        else:
+            _, idx = which
+            path = self.product_video_paths[idx]
+
         if not path:
-            return  # Chua chon clip cho truong hop nay
-        if self.current_playing == which:
-            return  # Dang phat dung clip nay roi, khong lam gi them
+            return  # Chua co file clip nay trong thu muc, giu nguyen video dang phat
+
         if self.video_capture is not None:
             self.video_capture.release()
         self.video_capture = cv2.VideoCapture(path)

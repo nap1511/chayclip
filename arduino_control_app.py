@@ -127,15 +127,6 @@ class SerialApp:
         ttk.Button(frame_top, text="Do lai ngay", command=self._auto_connect_tick_manual).pack(
             side="left", padx=5)
 
-        # --- Khung dieu khien den ---
-        frame_led = ttk.LabelFrame(self.control_panel, text="Dieu khien den (chan A0)", padding=10)
-        frame_led.pack(fill="x", padx=10, pady=10)
-
-        ttk.Button(frame_led, text="BAT DEN", command=lambda: self._send_command('1')).pack(
-            side="left", expand=True, fill="x", padx=5)
-        ttk.Button(frame_led, text="TAT DEN", command=lambda: self._send_command('0')).pack(
-            side="left", expand=True, fill="x", padx=5)
-
         # --- Khung hien thi trang thai cam bien ---
         frame_status = ttk.LabelFrame(self.control_panel, text="Trang thai cam bien", padding=10)
         frame_status.pack(fill="x", padx=10, pady=5)
@@ -145,12 +136,6 @@ class SerialApp:
             lbl = ttk.Label(frame_status, text=f"San pham {i + 1}: --", font=("Arial", 11))
             lbl.pack(anchor="w")
             self.product_labels.append(lbl)
-
-        self.alert_label = ttk.Label(frame_status, text="Den A0: --", font=("Arial", 12, "bold"))
-        self.alert_label.pack(anchor="w", pady=5)
-
-        self.manual_label = ttk.Label(frame_status, text="Dieu khien tay: --", font=("Arial", 10))
-        self.manual_label.pack(anchor="w")
 
         # --- Khung dong ho dem giay ---
         frame_timer = ttk.LabelFrame(self.control_panel, text="Thoi gian co san pham dang bi lay ra", padding=10)
@@ -259,15 +244,6 @@ class SerialApp:
         self.ser = None
         self.status_label.config(text="Dang do Arduino...", foreground="orange")
 
-    def _send_command(self, cmd: str):
-        if self.ser and self.ser.is_open:
-            try:
-                self.ser.write(cmd.encode())
-            except serial.SerialException:
-                pass
-        else:
-            messagebox.showwarning("Chua ket noi", "Chua tim thay Arduino, dang tu do lai...")
-
     def _read_loop(self):
         while self.running and self.ser and self.ser.is_open:
             try:
@@ -299,8 +275,6 @@ class SerialApp:
         try:
             parts = dict(item.split(":") for item in line.split(","))
             prod = parts.get("PROD")
-            alert = parts.get("ALERT")
-            manual = parts.get("MANUAL")
 
             if prod is not None and len(prod) == NUM_PRODUCTS:
                 for i in range(NUM_PRODUCTS):
@@ -321,7 +295,7 @@ class SerialApp:
                     self.product_removed_state[i] = is_removed
 
                 if self.removal_order:
-                    target_idx = self.removal_order[0]
+                    target_idx = self.removal_order[-1]  # San pham vua nhac ra gan nhat, con dang ngoai
                     self._play_video(("product", target_idx))
                 else:
                     self._play_video("background")
@@ -334,15 +308,6 @@ class SerialApp:
                     self.any_removed_active = False
                     self.removal_start_time = None
                     self.timer_label.config(text="0.0 giay")
-
-            if alert is not None:
-                is_alert = alert == '1'
-                self.alert_label.config(
-                    text=f"Den A0: {'BAT' if is_alert else 'TAT'}",
-                    foreground="red" if is_alert else "green")
-            if manual is not None:
-                self.manual_label.config(
-                    text=f"Dieu khien tay: {'BAT' if manual == '1' else 'TAT'}")
         except (ValueError, KeyError, IndexError):
             pass
 

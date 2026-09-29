@@ -1,9 +1,10 @@
 """
-App dieu khien den qua cong COM, hien thi trang thai 5 vi tri san pham + cam bien nghieng,
-tu dong do va ket noi Arduino (khong can chon cong COM tay), tu dong phat video tu thu muc clips/.
+App dieu khien den qua cong COM, hien thi trang thai 5 vi tri san pham,
+tu dong do va ket noi Arduino (khong can chon cong COM tay), tu dong phat video (co am thanh) tu thu muc clips/.
 
-Cai dat thu vien can thiet (chi can lam 1 lan):
-    python3 -m pip install pyserial opencv-python pillow
+CHI CHAY TREN WINDOWS. Can cai dat truoc khi dung:
+    1. Cai VLC Media Player (ban 64-bit) tu videolan.org
+    2. python3 -m pip install pyserial python-vlc
 
 Chay app:
     python3 arduino_control_app.py
@@ -28,15 +29,9 @@ import sys
 import os
 
 try:
-    import cv2
+    import vlc
 except ImportError:
-    cv2 = None
-
-try:
-    from PIL import Image, ImageTk
-except ImportError:
-    Image = None
-    ImageTk = None
+    vlc = None
 
 BAUD_RATE = 9600
 NUM_PRODUCTS = 5
@@ -92,8 +87,14 @@ class SerialApp:
         self.any_removed_active = False
         self.removal_start_time = None
 
-        self.video_capture = None
-        self.video_delay = 33
+        self.vlc_instance = None
+        self.media_player = None
+        self.list_player = None
+        if vlc is not None:
+            self.vlc_instance = vlc.Instance()
+            self.media_player = self.vlc_instance.media_player_new()
+            self.list_player = self.vlc_instance.media_list_player_new()
+            self.list_player.set_media_player(self.media_player)
 
         self.control_visible = False
 
@@ -101,7 +102,7 @@ class SerialApp:
         self._load_clips_from_folder()
         self._poll_queue()
         self._update_timer()
-        self._update_video_frame()
+        self._embed_video_player()
         self._auto_connect_tick()  # Bat dau vong tu dong do & ket noi Arduino
 
         self.root.attributes("-fullscreen", True)
@@ -110,8 +111,8 @@ class SerialApp:
 
     def _build_ui(self):
         # --- Lop nen: video phu kin toan bo cua so ---
-        self.video_label = tk.Label(self.root, bg="black")
-        self.video_label.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self.video_frame = tk.Frame(self.root, bg="black")
+        self.video_frame.place(relx=0, rely=0, relwidth=1, relheight=1)
 
         # --- Lop noi: khung dieu khien, an mac dinh, hien khi nhan F1 ---
         self.control_panel = tk.Frame(self.root, bg="#1e1e1e")
@@ -138,9 +139,6 @@ class SerialApp:
         # --- Khung hien thi trang thai cam bien ---
         frame_status = ttk.LabelFrame(self.control_panel, text="Trang thai cam bien", padding=10)
         frame_status.pack(fill="x", padx=10, pady=5)
-
-        self.tilt_label = ttk.Label(frame_status, text="Nghieng: --", font=("Arial", 11))
-        self.tilt_label.pack(anchor="w")
 
         self.product_labels = []
         for i in range(NUM_PRODUCTS):
@@ -185,6 +183,13 @@ class SerialApp:
             self.control_panel.place(relx=0, rely=0, relwidth=1, relheight=1)
             self.control_panel.lift()
         self.control_visible = not self.control_visible
+
+    def _embed_video_player(self):
+        if self.media_player is None:
+            return
+        self.root.update_idletasks()
+        handle = self.video_frame.winfo_id()
+        self.media_player.set_hwnd(handle)
 
     # ===== NAP CLIP TU THU MUC CO DINH =====
     def _load_clips_from_folder(self):
@@ -289,18 +294,13 @@ class SerialApp:
         self.log_text.config(state="disabled")
 
     def _parse_line(self, line: str):
-        if "TILT:" not in line or "PROD:" not in line:
+        if "PROD:" not in line:
             return
         try:
             parts = dict(item.split(":") for item in line.split(","))
-            tilt = parts.get("TILT")
             prod = parts.get("PROD")
             alert = parts.get("ALERT")
             manual = parts.get("MANUAL")
-
-            if tilt is not None:
-                self.tilt_label.config(
-                    text=f"Nghieng: {'CO' if tilt == '1' else 'Khong'}")
 
             if prod is not None and len(prod) == NUM_PRODUCTS:
                 for i in range(NUM_PRODUCTS):
@@ -352,25 +352,8 @@ class SerialApp:
             self.timer_label.config(text=f"{elapsed:.1f} giay")
         self.root.after(100, self._update_timer)
 
-    def _update_video_frame(self):
-        if cv2 is not None and Image is not None and self.video_capture is not None:
-            ret, frame = self.video_capture.read()
-            if not ret:
-                self.video_capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                ret, frame = self.video_capture.read()
-            if ret:
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                w = self.video_label.winfo_width() or self.root.winfo_screenwidth()
-                h = self.video_label.winfo_height() or self.root.winfo_screenheight()
-                img = Image.fromarray(frame)
-                img.thumbnail((max(w, 1), max(h, 1)))
-                imgtk = ImageTk.PhotoImage(image=img)
-                self.video_label.imgtk = imgtk
-                self.video_label.config(image=imgtk)
-        self.root.after(self.video_delay, self._update_video_frame)
-
     def _play_video(self, which):
-        if cv2 is None:
+        if self.vlc_instance is None or self.list_player is None:
             return
         if which == self.current_playing:
             return
@@ -384,16 +367,16 @@ class SerialApp:
         if not path:
             return  # Chua co file clip nay trong thu muc, giu nguyen video dang phat
 
-        if self.video_capture is not None:
-            self.video_capture.release()
-        self.video_capture = cv2.VideoCapture(path)
-        fps = self.video_capture.get(cv2.CAP_PROP_FPS)
-        self.video_delay = int(1000 / fps) if fps and fps > 0 else 33
+        self.list_player.stop()
+        media_list = self.vlc_instance.media_list_new([path])
+        self.list_player.set_media_list(media_list)
+        self.list_player.set_playback_mode(vlc.PlaybackMode.loop)
+        self.list_player.play()
         self.current_playing = which
 
     def on_close(self):
-        if self.video_capture is not None:
-            self.video_capture.release()
+        if self.list_player is not None:
+            self.list_player.stop()
         self._disconnect()
         self.root.destroy()
 

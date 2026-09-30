@@ -86,6 +86,7 @@ class SerialApp:
         self.last_switch_time = 0.0        # Thoi diem lan cuoi thuc su doi clip
         self.switch_cooldown = 0.4         # Khoang cach toi thieu (giay) giua 2 lan doi clip
         self._pending_switch_scheduled = False
+        self._video_switch_lock = threading.Lock()
 
         self.any_removed_active = False
         self.removal_start_time = None
@@ -358,12 +359,22 @@ class SerialApp:
         if not path:
             return  # Chua co file clip nay trong thu muc, giu nguyen video dang phat
 
-        self.list_player.stop()
-        media_list = self.vlc_instance.media_list_new([path])
-        self.list_player.set_media_list(media_list)
-        self.list_player.set_playback_mode(vlc.PlaybackMode.loop)
-        self.list_player.play()
-        self.current_playing = which
+        self.current_playing = which  # Cap nhat ngay, de cac yeu cau sau biet day la yeu cau moi nhat
+        threading.Thread(target=self._do_switch_video, args=(which, path), daemon=True).start()
+
+    def _do_switch_video(self, which, path):
+        # Chay tren thread rieng, khong lam dong bang giao dien chinh du VLC co cham
+        with self._video_switch_lock:
+            if which != self.current_playing:
+                return  # Da co yeu cau moi hon phat sinh trong luc cho, bo qua cai nay cho khoi lech
+            try:
+                self.list_player.stop()
+                media_list = self.vlc_instance.media_list_new([path])
+                self.list_player.set_media_list(media_list)
+                self.list_player.set_playback_mode(vlc.PlaybackMode.loop)
+                self.list_player.play()
+            except Exception:
+                pass
 
     def on_close(self):
         if self.list_player is not None:

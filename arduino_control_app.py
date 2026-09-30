@@ -83,6 +83,9 @@ class SerialApp:
         self.product_video_paths = [None] * NUM_PRODUCTS
         self.background_video_path = None
         self.current_playing = None
+        self.last_switch_time = 0.0        # Thoi diem lan cuoi thuc su doi clip
+        self.switch_cooldown = 0.4         # Khoang cach toi thieu (giay) giua 2 lan doi clip
+        self._pending_switch_scheduled = False
 
         self.any_removed_active = False
         self.removal_start_time = None
@@ -296,9 +299,9 @@ class SerialApp:
 
                 if self.removal_order:
                     target_idx = self.removal_order[-1]  # San pham vua nhac ra gan nhat, con dang ngoai
-                    self._play_video(("product", target_idx))
+                    self._request_video_switch(("product", target_idx))
                 else:
-                    self._play_video("background")
+                    self._request_video_switch("background")
 
                 any_removed = bool(self.removal_order)
                 if any_removed and not self.any_removed_active:
@@ -316,6 +319,29 @@ class SerialApp:
             elapsed = time.time() - self.removal_start_time
             self.timer_label.config(text=f"{elapsed:.1f} giay")
         self.root.after(100, self._update_timer)
+
+    def _request_video_switch(self, which):
+        """Goi thay cho _play_video truc tiep, de gioi han toc do doi clip toi da.
+        Neu vua doi clip qua gan day, hoan lai va tu kiem tra lai sau, tranh spam
+        lenh vao VLC lien tuc gay dung/treo app khi cam bien thay doi qua nhanh."""
+        now = time.time()
+        elapsed = now - self.last_switch_time
+        if elapsed >= self.switch_cooldown:
+            self._play_video(which)
+            self.last_switch_time = now
+        elif not self._pending_switch_scheduled:
+            self._pending_switch_scheduled = True
+            remaining_ms = int((self.switch_cooldown - elapsed) * 1000) + 20
+            self.root.after(remaining_ms, self._process_pending_switch)
+
+    def _process_pending_switch(self):
+        self._pending_switch_scheduled = False
+        # Doc lai trang thai MOI NHAT tai thoi diem nay (khong dung "which" cu da loi thoi)
+        if self.removal_order:
+            target = ("product", self.removal_order[-1])
+        else:
+            target = "background"
+        self._request_video_switch(target)
 
     def _play_video(self, which):
         if self.vlc_instance is None or self.list_player is None:
